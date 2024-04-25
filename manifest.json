@@ -1,0 +1,11 @@
+{
+	"id": "jujunaut-ai",
+	"name": "Jujunaut AI",
+	"version": "0.1.0",
+	"minAppVersion": "0.1.0",
+	"description": "Connects Obsidian to the GPT-4 Vision API and other models to provide an AI-integrated notetaking environment.",
+	"author": "julianjuko",
+	"authorUrl": "https://twitter.com/julianjuko",
+	"fundingUrl": "",
+	"isDesktopOnly": false
+}
