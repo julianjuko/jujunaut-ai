@@ -8,6 +8,9 @@ import {
 	Setting,
 } from "obsidian";
 
+import { promises as fs } from "fs";
+import * as path from "path";
+
 interface JujunautAiSettings {
 	frequencyPenalty: number;
 	maxTokens: number;
@@ -15,15 +18,22 @@ interface JujunautAiSettings {
 	presencePenalty: number;
 	temperature: number;
 	topP: number;
+	useBlockquote: boolean;
 }
+
+export type Prompt = {
+	role: "system" | "user";
+	content: string;
+};
 
 const DEFAULT_SETTINGS: JujunautAiSettings = {
 	frequencyPenalty: 0,
 	maxTokens: 4096,
 	openAiApiKey: "",
 	presencePenalty: 0,
-	temperature: 0.5,
+	temperature: 1,
 	topP: 0.95,
+	useBlockquote: false, // Default to false
 };
 
 export default class JujunautAiPlugin extends Plugin {
@@ -70,6 +80,84 @@ export default class JujunautAiPlugin extends Plugin {
 
 	onunload() {}
 
+	parseJujunautFilesBlock(text: string): string[] {
+		const blockRegex = /```jujunaut-files\s+([\s\S]*?)```/g;
+		const match = blockRegex.exec(text);
+		if (match) {
+			return match[1]
+				.split("\n")
+				.map((line) => line.trim())
+				.filter((line) => line.length > 0);
+		}
+		return [];
+	}
+
+	async resolveAndReadFiles(
+		filePaths: string[]
+	): Promise<{ path: string; content: string }[]> {
+		const filesContent = [];
+		for (const filePath of filePaths) {
+			const resolvedPath = this.resolvePath(filePath);
+			try {
+				const stats = await fs.stat(resolvedPath);
+				if (stats.isDirectory()) {
+					const entries = await fs.readdir(resolvedPath, {
+						withFileTypes: true,
+					});
+					for (const entry of entries) {
+						if (entry.isFile()) {
+							const fullPath = path.join(
+								resolvedPath,
+								entry.name
+							);
+							const fileContent = await fs.readFile(
+								fullPath,
+								"utf8"
+							);
+							filesContent.push({
+								path: fullPath,
+								content: fileContent,
+							});
+						}
+					}
+				} else {
+					const fileContent = await fs.readFile(resolvedPath, "utf8");
+					filesContent.push({
+						path: resolvedPath,
+						content: fileContent,
+					});
+				}
+			} catch (error) {
+				console.error(
+					`Error reading file or directory ${resolvedPath}: ${error}`
+				);
+			}
+		}
+		return filesContent;
+	}
+
+	// Update the resolvePath method to handle different types of paths
+	resolvePath(filePath: string): string {
+		// Handle home directory paths
+		if (filePath.startsWith("~")) {
+			filePath = path.join(
+				process.env.HOME || process.env.USERPROFILE || "",
+				filePath.slice(1)
+			);
+		}
+
+		// Resolve relative paths
+		if (!path.isAbsolute(filePath)) {
+			filePath = path.resolve(
+				//@ts-ignore
+				this.app.vault.adapter.basePath,
+				filePath
+			);
+		}
+
+		return filePath;
+	}
+
 	async generateText(editor: Editor, view: MarkdownView) {
 		const text = view.data;
 		if (text.trim().length === 0) {
@@ -82,11 +170,24 @@ export default class JujunautAiPlugin extends Plugin {
 			);
 			return;
 		}
-		await this.streamOpenAI(text, editor);
-	}
 
-	async streamOpenAI(prompt: string, editor: Editor): Promise<void> {
+		const filePaths = this.parseJujunautFilesBlock(text);
+		const filesContent = await this.resolveAndReadFiles(filePaths);
+
+		const systemPrompts: Prompt[] = filesContent.map((file) => ({
+			role: "system",
+			content: `File: ${file.path}\n${file.content}`,
+		}));
+
+		await this.streamOpenAI(text, editor, systemPrompts);
+	}
+	async streamOpenAI(
+		prompt: string,
+		editor: Editor,
+		systemPrompts: Prompt[]
+	): Promise<void> {
 		const apiKey = this.settings.openAiApiKey;
+		const messages = [...systemPrompts, { role: "user", content: prompt }];
 
 		const response = await fetch(
 			"https://api.openai.com/v1/chat/completions",
@@ -100,12 +201,7 @@ export default class JujunautAiPlugin extends Plugin {
 					frequency_penalty: this.settings.frequencyPenalty,
 					max_tokens: this.settings.maxTokens,
 					model: "gpt-4-turbo",
-					messages: [
-						{
-							role: "user",
-							content: prompt,
-						},
-					],
+					messages,
 					presence_penalty: this.settings.presencePenalty,
 					stream: true,
 					temperature: this.settings.temperature,
@@ -124,6 +220,9 @@ export default class JujunautAiPlugin extends Plugin {
 		let buffer = "";
 
 		try {
+			if (this.settings.useBlockquote) {
+				editor.replaceSelection("> ");
+			}
 			while (this.isStreaming) {
 				const { done, value } = await this.streamReader.read();
 				if (done) {
@@ -150,8 +249,13 @@ export default class JujunautAiPlugin extends Plugin {
 							json.choices.length > 0 &&
 							json.choices[0].delta
 						) {
-							const text = json.choices[0].delta.content;
-							editor.replaceSelection(text);
+							let text = json.choices[0].delta.content;
+							if (this.settings.useBlockquote) {
+								text = text.split("\n").join("\n> ");
+								editor.replaceSelection(text);
+							} else {
+								editor.replaceSelection(text);
+							}
 						}
 					} catch (e) {
 						console.error("Error parsing JSON", e);
@@ -188,8 +292,20 @@ export default class JujunautAiPlugin extends Plugin {
 	async saveSettings() {
 		await this.saveData(this.settings);
 	}
-
 	displaySettings(containerEl: HTMLElement): void {
+		new Setting(containerEl)
+			.setName("OpenAI API Key")
+			.setDesc("Enter your OpenAI API key here.")
+			.addText((text) =>
+				text
+					.setPlaceholder("Enter your API key")
+					.setValue(this.settings.openAiApiKey)
+					.onChange(async (value) => {
+						this.settings.openAiApiKey = value;
+						await this.saveSettings();
+					})
+			);
+
 		new Setting(containerEl)
 			.setName("Temperature")
 			.setDesc(
@@ -197,8 +313,9 @@ export default class JujunautAiPlugin extends Plugin {
 			)
 			.addSlider((slider) =>
 				slider
-					.setLimits(0.0, 2.0, 1.0)
+					.setLimits(0.0, 2.0, 0.01)
 					.setValue(this.settings.temperature)
+					.setDynamicTooltip()
 					.onChange(async (value) => {
 						this.settings.temperature = value;
 						await this.saveSettings();
@@ -212,8 +329,9 @@ export default class JujunautAiPlugin extends Plugin {
 			)
 			.addSlider((slider) =>
 				slider
-					.setLimits(-2.0, 2.0, 0.0)
+					.setLimits(-2.0, 2.0, 0.01)
 					.setValue(this.settings.frequencyPenalty)
+					.setDynamicTooltip()
 					.onChange(async (value) => {
 						this.settings.frequencyPenalty = value;
 						await this.saveSettings();
@@ -227,8 +345,9 @@ export default class JujunautAiPlugin extends Plugin {
 			)
 			.addSlider((slider) =>
 				slider
-					.setLimits(-2.0, 2.0, 0.0)
+					.setLimits(-2.0, 2.0, 0.01)
 					.setValue(this.settings.presencePenalty)
+					.setDynamicTooltip()
 					.onChange(async (value) => {
 						this.settings.presencePenalty = value;
 						await this.saveSettings();
@@ -238,14 +357,15 @@ export default class JujunautAiPlugin extends Plugin {
 		new Setting(containerEl)
 			.setName("top_p")
 			.setDesc(
-				"Also controls randomness: lower values make responses more deterministic."
+				"Controls the cumulative probability for model responses, affecting randomness."
 			)
 			.addSlider((slider) =>
 				slider
-					.setLimits(0.0, 2.0, 1.0)
-					.setValue(this.settings.temperature)
+					.setLimits(0.0, 1.0, 0.01) // Correcting this to a realistic range for top_p
+					.setValue(this.settings.topP)
+					.setDynamicTooltip()
 					.onChange(async (value) => {
-						this.settings.temperature = value;
+						this.settings.topP = value;
 						await this.saveSettings();
 					})
 			);
@@ -263,14 +383,13 @@ export default class JujunautAiPlugin extends Plugin {
 			);
 
 		new Setting(containerEl)
-			.setName("OpenAI API Key")
-			.setDesc("Enter your OpenAI API key here.")
-			.addText((text) =>
-				text
-					.setPlaceholder("Enter your API key")
-					.setValue(this.settings.openAiApiKey)
+			.setName("Use Blockquote for Output")
+			.setDesc("Toggle to wrap AI-generated text in blockquotes.")
+			.addToggle((toggle) =>
+				toggle
+					.setValue(this.settings.useBlockquote)
 					.onChange(async (value) => {
-						this.settings.openAiApiKey = value;
+						this.settings.useBlockquote = value;
 						await this.saveSettings();
 					})
 			);
