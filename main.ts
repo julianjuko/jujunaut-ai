@@ -73,7 +73,7 @@ export default class JujunautAiPlugin extends Plugin {
 		});
 
 		const ribbonIconEl = this.addRibbonIcon(
-			"star",
+			"bot",
 			"Jujunaut AI",
 			async (evt: MouseEvent) => {
 				const activeView =
